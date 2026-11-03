@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EMS County Map</title>
+<style>
+  [hidden] { display: none !important; }
+  html, body { margin: 0; height: 100%; font: 14px system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #map { position: absolute; inset: 0; background: #e5e3df; }
+  #panel { position: absolute; top: 60px; right: 10px; z-index: 5; background: #fff; padding: 10px 12px;
+           border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.3); width: 230px; max-height: 70vh; overflow: auto; }
+  #panel h3 { margin: 0 0 6px; font-size: 15px; }
+  #panel label { display: flex; align-items: center; gap: 6px; margin: 4px 0; cursor: pointer; }
+  .sw { width: 12px; height: 12px; border-radius: 2px; flex: none; }
+  #status { font-size: 12px; color: #555; margin-top: 6px; }
+  .err { color: #b91c1c; }
+  #nokey { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 16px; }
+  #nokey div { max-width: 460px; background: #fff; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,.2); line-height: 1.5; }
+  code { background: #f1f3f4; padding: 1px 4px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel" hidden>
+  <h3>Layers</h3>
+  <div id="layers"></div>
+  <div id="status">Loading…</div>
+</div>
+<div id="nokey" hidden><div>
+  <b>The map key wasn't added</b><br>
+  Add a repository secret named <code>GOOGLE_MAPS_API_KEY</code> (Settings → Secrets and variables → Actions),
+  set Pages to deploy from <b>GitHub Actions</b>, then re-run the "Deploy map" workflow.
+</div></div>
+
+<script>
+/* =====================================================================
+   SETTINGS
+   ===================================================================== */
+// Do NOT paste your key here. GitHub fills this in from the repository secret
+// GOOGLE_MAPS_API_KEY when it builds the site (see .github/workflows/deploy.yml).
+const GOOGLE_MAPS_API_KEY = '__GOOGLE_MAPS_API_KEY__';
+
+// Put .kml files in the "kml" folder. The page finds them through GitHub's API,
+// and falls back to the list in kml/files.json if that fails.
+const KML_FOLDER = 'kml';
+const GITHUB_OWNER = '';   // blank = auto-detect from the web address
+const GITHUB_REPO  = '';
+const BRANCH       = '';
+
+const START = { lat: 41.85, lng: -74.0, zoom: 9 };
+const COLORS = ['#1a73e8','#d93025','#188038','#9334e6','#e8710a','#12b5cb','#c5221f','#7cb342'];
+
+/* ---------- find the KML files ---------- */
+function repoFromUrl() {
+  const host = location.hostname;
+  if (!host.endsWith('.github.io')) return null;
+  const owner = host.replace('.github.io', '');
+  const first = location.pathname.split('/').filter(Boolean)[0];
+  return { owner, repo: first && !first.includes('.') ? first : host };
+}
+async function listKmlFiles() {
+  const r = (GITHUB_OWNER && GITHUB_REPO) ? { owner: GITHUB_OWNER, repo: GITHUB_REPO } : repoFromUrl();
+  if (r) {
+    try {
+      const res = await fetch(`https://api.github.com/repos/${r.owner}/${r.repo}/contents/${KML_FOLDER}` + (BRANCH ? `?ref=${BRANCH}` : ''));
+      if (res.ok) return (await res.json()).filter(f => f.type === 'file' && /\.kml$/i.test(f.name)).map(f => f.name);
+    } catch (e) {}
+  }
+  const res = await fetch(`${KML_FOLDER}/files.json`, { cache: 'no-store' });
+  if (!res.ok) throw new Error('Could not list the KML files. Check that the "kml" folder exists.');
+  return await res.json();
+}
+
+/* ---------- read a KML file and draw it on Google Maps ---------- */
+function parseCoords(el) {
+  return el.textContent.trim().split(/\s+/)
+    .map(p => { const [lng, lat] = p.split(',').map(Number); return { lat, lng }; })
+    .filter(c => !isNaN(c.lat) && !isNaN(c.lng));
+}
+function kmlToFeatures(text, color, map, info) {
+  const doc = new DOMParser().parseFromString(text, 'text/xml');
+  if (doc.getElementsByTagName('parsererror').length) throw new Error('not valid KML');
+  const features = [], bounds = new google.maps.LatLngBounds();
+  for (const pm of doc.getElementsByTagName('Placemark')) {
+    const name = pm.getElementsByTagName('name')[0]?.textContent || 'Unnamed';
+    const desc = pm.getElementsByTagName('description')[0]?.textContent || '';
+    let html = `<b>${name}</b>` + (desc ? `<div>${desc}</div>` : '');
+    for (const d of pm.getElementsByTagName('Data')) {
+      const key = d.getAttribute('name');
+      if (['id', 'url', 'name'].includes(key)) continue;
+      html += `<br>${key}: ${d.getElementsByTagName('value')[0]?.textContent ?? ''}`;
+    }
+    const add = (f, anchor) => {
+      f.addListener('click', e => { info.setContent(html); info.setPosition(e?.latLng || anchor); info.open(map); });
+      if (!(f instanceof google.maps.Marker) && f.setOptions) {
+        f.addListener('mouseover', () => f.setOptions({ fillOpacity: 0.4 }));
+        f.addListener('mouseout',  () => f.setOptions({ fillOpacity: 0.2 }));
+      }
+      f.setMap(map); features.push(f);
+    };
+    for (const poly of pm.getElementsByTagName('Polygon')) {
+      const paths = [];
+      for (const tag of ['outerBoundaryIs', 'innerBoundaryIs'])
+        for (const b of poly.getElementsByTagName(tag)) {
+          const c = b.getElementsByTagName('coordinates')[0];
+          if (c) paths.push(parseCoords(c));
+        }
+      paths.flat().forEach(p => bounds.extend(p));
+      add(new google.maps.Polygon({ paths, strokeColor: color, strokeWeight: 2, fillColor: color, fillOpacity: 0.2 }));
+    }
+    for (const ls of pm.getElementsByTagName('LineString')) {
+      const path = parseCoords(ls.getElementsByTagName('coordinates')[0]);
+      path.forEach(p => bounds.extend(p));
+      add(new google.maps.Polyline({ path, strokeColor: color, strokeWeight: 3 }));
+    }
+    for (const pt of pm.getElementsByTagName('Point')) {
+      const position = parseCoords(pt.getElementsByTagName('coordinates')[0])[0];
+      bounds.extend(position);
+      add(new google.maps.Marker({ position, title: name }), position);
+    }
+  }
+  return { features, bounds };
+}
+
+/* ---------- start ---------- */
+window.initMap = async function () {
+  const map = new google.maps.Map(document.getElementById('map'), {
+    center: { lat: START.lat, lng: START.lng }, zoom: START.zoom,
+    mapTypeControl: true, mapTypeControlOptions: { position: google.maps.ControlPosition.TOP_LEFT }
+  });
+  const info = new google.maps.InfoWindow();
+  const allBounds = new google.maps.LatLngBounds();
+  const panel = document.getElementById('panel'), status = document.getElementById('status');
+  panel.hidden = false;
+  try {
+    const files = await listKmlFiles();
+    if (!files.length) { status.textContent = 'No .kml files found in the kml folder yet.'; return; }
+    let i = 0, ok = 0;
+    for (const file of files) {
+      const color = COLORS[i++ % COLORS.length];
+      const label = file.replace(/\.kml$/i, '').replace(/[-_]/g, ' ');
+      try {
+        const res = await fetch(`${KML_FOLDER}/${encodeURIComponent(file)}`);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const { features, bounds } = kmlToFeatures(await res.text(), color, map, info);
+        allBounds.union(bounds);
+        const row = document.createElement('label');
+        row.title = 'Double-click to zoom';
+        row.innerHTML = `<input type="checkbox" checked><span class="sw" style="background:${color}"></span><span></span>`;
+        row.lastChild.textContent = label;
+        row.querySelector('input').onchange = e => features.forEach(f => f.setMap(e.target.checked ? map : null));
+        row.ondblclick = () => map.fitBounds(bounds);
+        document.getElementById('layers').appendChild(row);
+        ok++;
+      } catch (e) {
+        const p = document.createElement('div');
+        p.className = 'err'; p.textContent = `${file}: couldn't load (${e.message})`;
+        document.getElementById('layers').appendChild(p);
+      }
+    }
+    if (!allBounds.isEmpty()) map.fitBounds(allBounds);
+    status.textContent = `${ok} file${ok === 1 ? '' : 's'} loaded`;
+  } catch (e) {
+    status.innerHTML = `<span class="err">${e.message}</span>`;
+  }
+};
+
+if (GOOGLE_MAPS_API_KEY && !GOOGLE_MAPS_API_KEY.startsWith('__')) {
+  const s = document.createElement('script');
+  s.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(GOOGLE_MAPS_API_KEY)}&callback=initMap`;
+  s.async = true;
+  document.head.appendChild(s);
+} else {
+  document.getElementById('nokey').hidden = false;
+}
+</script>
+</body>
+</html>
